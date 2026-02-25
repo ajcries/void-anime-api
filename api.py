@@ -1,23 +1,17 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_caching import Cache
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 import requests
 from bs4 import BeautifulSoup
 import random
 import re
 from urllib.parse import quote_plus
 
-# --- Configuration & Security ---
+# --- Configuration ---
 api_app = Flask(__name__)
 CORS(api_app)
 
-limiter = Limiter(key_func=get_remote_address, default_limits=["100 per minute"])
-limiter.init_app(api_app)
-
-# Caching: 1 hour default, but some endpoints use shorter times
+# Caching: 1 hour default, some endpoints override with shorter/longer times
 cache = Cache(api_app, config={
     'CACHE_TYPE': 'SimpleCache',
     'CACHE_DEFAULT_TIMEOUT': 3600
@@ -29,17 +23,16 @@ AJAX_BASE = f"{BASE_URL}/ajax"
 class ScraperEngine:
     def __init__(self):
         self.session = requests.Session()
-        # Use a rotating list of modern user agents
+        # Rotating modern user agents
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         ]
-        # Set a default timeout for all requests
         self.session.timeout = 10
 
     def _get_soup(self, url, timeout=10):
-        """Fetch and parse HTML with rotating headers and timeout"""
+        """Fetch and parse HTML with rotating headers"""
         headers = {"User-Agent": random.choice(self.user_agents)}
         try:
             response = self.session.get(url, headers=headers, timeout=timeout)
@@ -50,9 +43,12 @@ class ScraperEngine:
             return None
 
     def _get_ajax(self, endpoint, params=None):
-        """Fetch AJAX JSON endpoint (used for episode lists)"""
+        """Fetch AJAX JSON endpoint"""
         url = f"{AJAX_BASE}/{endpoint}"
-        headers = {"User-Agent": random.choice(self.user_agents), "X-Requested-With": "XMLHttpRequest"}
+        headers = {
+            "User-Agent": random.choice(self.user_agents),
+            "X-Requested-With": "XMLHttpRequest"
+        }
         try:
             resp = self.session.get(url, params=params, headers=headers, timeout=10)
             if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("application/json"):
@@ -61,14 +57,12 @@ class ScraperEngine:
         except:
             return None
 
-    # --- Existing methods (trending, sidebar) ---
     def get_trending(self):
-        """Scrapes the trending anime from the home page"""
         soup = self._get_soup(f"{BASE_URL}/home")
-        if not soup: return []
+        if not soup:
+            return []
         
         trending = []
-        # Selector may change; this is based on current HiAnime structure
         items = soup.select(".trending .item, #anime-trending .item")
         for item in items:
             rank_elem = item.select_one(".number span")
@@ -83,14 +77,12 @@ class ScraperEngine:
         return trending
 
     def get_sidebar_list(self, list_type="top-airing"):
-        """Scrapes sidebar lists: 'top-airing', 'most-popular', 'most-favorite'"""
         soup = self._get_soup(f"{BASE_URL}/home")
-        if not soup: return []
-
+        if not soup:
+            return []
+        
         results = []
-        # Find the block containing the list type
         search_term = list_type.replace('-', ' ').lower()
-        # Look for a heading that contains the search term
         blocks = soup.select(".block_area-realtime, .block_area-sidebar")
         target_block = None
         for block in blocks:
@@ -98,7 +90,7 @@ class ScraperEngine:
             if header and search_term in header.text.lower():
                 target_block = block
                 break
-
+        
         if target_block:
             items = target_block.select("ul li")
             for item in items:
@@ -112,30 +104,25 @@ class ScraperEngine:
                     })
         return results
 
-    # --- NEW: Search ---
     def search(self, keyword, page=1):
-        """Search anime by keyword"""
         url = f"{BASE_URL}/search?keyword={quote_plus(keyword)}&page={page}"
         soup = self._get_soup(url)
         if not soup:
             return {"items": [], "total_pages": 1, "current_page": page}
 
         items = []
-        # Each result is typically in a div with class "flw-item"
         for el in soup.select(".flw-item"):
             link = el.select_one("a.film-poster")
             if not link:
                 continue
             href = link.get("href", "")
             slug = href.strip("/").split("/")[-1] if href else ""
-            # Extract anime ID from slug (usually last numeric part)
             id_match = re.search(r'-(\d+)$', slug)
             anime_id = id_match.group(1) if id_match else slug
 
             title_tag = el.select_one(".film-name a")
             title = title_tag.get_text(strip=True) if title_tag else "???"
 
-            # Optional: extract poster, type, year
             poster_img = link.select_one("img")
             poster = poster_img.get("data-src") or poster_img.get("src") if poster_img else None
             if poster and poster.startswith("//"):
@@ -156,7 +143,6 @@ class ScraperEngine:
                 "year": year
             })
 
-        # Pagination: find number of pages
         pagination = soup.select_one(".pagination")
         total_pages = 1
         if pagination:
@@ -166,29 +152,23 @@ class ScraperEngine:
 
         return {"items": items, "total_pages": total_pages, "current_page": page}
 
-    # --- NEW: Get anime info (details) ---
     def get_anime_info(self, anime_id):
-        """Fetch detailed info about an anime using its ID/slug"""
-        url = f"{BASE_URL}/{anime_id}"  # anime_id can be slug like 'one-piece-100'
+        url = f"{BASE_URL}/{anime_id}"
         soup = self._get_soup(url)
         if not soup:
             return None
 
-        # Title
         title_elem = soup.select_one("h2.film-name, .anisc-name")
         title = title_elem.get_text(strip=True) if title_elem else "Unknown"
 
-        # Synopsis
         synopsis_elem = soup.select_one(".film-description .text, .anisc-description .text")
         synopsis = synopsis_elem.get_text(strip=True) if synopsis_elem else None
 
-        # Poster
         poster_elem = soup.select_one(".film-poster img, .anisc-poster img")
         poster = poster_elem.get("src") or poster_elem.get("data-src") if poster_elem else None
         if poster and poster.startswith("//"):
             poster = "https:" + poster
 
-        # Additional info (genres, status, etc.)
         info = {}
         for row in soup.select(".anisc-info .item, .film-info .row"):
             name = row.select_one(".name, .item-head")
@@ -197,7 +177,6 @@ class ScraperEngine:
                 key = name.get_text(strip=True).rstrip(":").lower().replace(" ", "_")
                 val = value.get_text(strip=True)
                 if key == "genres":
-                    # Convert to list
                     val = [g.strip() for g in val.split(",") if g.strip()]
                 info[key] = val
 
@@ -209,20 +188,14 @@ class ScraperEngine:
             **info
         }
 
-    # --- NEW: Get episodes for an anime ---
     def get_episodes(self, anime_id):
-        """Fetch episode list for given anime ID/slug"""
         url = f"{BASE_URL}/{anime_id}"
         soup = self._get_soup(url)
         if not soup:
             return []
 
         episodes = []
-
-        # Try to extract anime ID from page for AJAX call
-        # Often the page contains a data-id attribute or script with anime ID
         anime_ajax_id = None
-        # Look for a meta tag or script
         script_tags = soup.find_all("script")
         for script in script_tags:
             if script.string and "anime_id" in script.string:
@@ -231,7 +204,6 @@ class ScraperEngine:
                     anime_ajax_id = match.group(1)
                     break
 
-        # If we found AJAX ID, fetch episode list from AJAX endpoint
         if anime_ajax_id:
             ajax_data = self._get_ajax(f"v2/episode/list/{anime_ajax_id}")
             if ajax_data and "html" in ajax_data:
@@ -249,7 +221,6 @@ class ScraperEngine:
                             "title": ep_title or f"Episode {ep_num}"
                         })
 
-        # Fallback: try to scrape episode list from static page
         if not episodes:
             ep_items = soup.select("#detail-ss-list .ss-list a, .episode-list .ep-item")
             for el in ep_items:
@@ -265,7 +236,6 @@ class ScraperEngine:
                         "title": title or f"Episode {num}"
                     })
 
-        # Sort by episode number (if numeric)
         try:
             episodes.sort(key=lambda x: float(x["number"]) if x["number"].replace(".", "").isdigit() else 9999)
         except:
@@ -274,15 +244,15 @@ class ScraperEngine:
         return episodes
 
 
-# Initialize the engine
+# Initialize scraper
 scraper = ScraperEngine()
 
-# --- Endpoints ---
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
 
 @api_app.route('/api/discover')
 @cache.cached(timeout=43200)  # 12 hours
 def api_discover():
-    """Returns combined lists of trending, top airing, most popular, most favorite"""
     try:
         return jsonify({
             "status": "success",
@@ -296,13 +266,14 @@ def api_discover():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 @api_app.route('/api/search')
-@cache.cached(timeout=3600, query_string=True)  # 1 hour per query
+@cache.cached(timeout=3600, query_string=True)
 def api_search():
-    """Search anime by keyword"""
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"status": "error", "message": "Missing query parameter 'q'"}), 400
+    
     page = int(request.args.get("page", 1))
     try:
         data = scraper.search(q, page)
@@ -310,10 +281,10 @@ def api_search():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 @api_app.route('/api/anime/<path:anime_id>')
 @cache.cached(timeout=7200)  # 2 hours
 def api_anime_info(anime_id):
-    """Get detailed info for an anime (by ID or slug)"""
     try:
         info = scraper.get_anime_info(anime_id)
         if not info:
@@ -322,19 +293,16 @@ def api_anime_info(anime_id):
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
 @api_app.route('/api/episodes/<path:anime_id>')
 @cache.cached(timeout=3600)  # 1 hour
 def api_episodes(anime_id):
-    """Get episode list for an anime"""
     try:
         episodes = scraper.get_episodes(anime_id)
         return jsonify({"status": "success", "data": episodes})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@api_app.errorhandler(RateLimitExceeded)
-def _handle_rate_limit_exceeded(e):
-    return jsonify({"status": "error", "message": "Too many requests. Please slow down."}), 429
 
 if __name__ == "__main__":
     api_app.run(debug=False, host="0.0.0.0", port=5000)
