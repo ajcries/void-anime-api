@@ -17,45 +17,66 @@ cache = Cache(api_app, config={
     'CACHE_DEFAULT_TIMEOUT': 3600
 })
 
-BASE_URL = "https://hianime.to"
+BASE_URL = "https://aniwatchtv.to"
 AJAX_BASE = f"{BASE_URL}/ajax"
+
 
 class ScraperEngine:
     def __init__(self):
         self.session = requests.Session()
-        # Rotating modern user agents
         self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ]
-        self.session.timeout = 10
 
-    def _get_soup(self, url, timeout=10):
-        """Fetch and parse HTML with rotating headers"""
-        headers = {"User-Agent": random.choice(self.user_agents)}
+    def _headers(self):
+        return {
+            "User-Agent": random.choice(self.user_agents),
+            "Referer": BASE_URL,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    def _get_soup(self, url, timeout=12):
+        """Fetch and parse HTML with rotating headers."""
         try:
-            response = self.session.get(url, headers=headers, timeout=timeout)
+            response = self.session.get(url, headers=self._headers(), timeout=timeout)
             response.raise_for_status()
             return BeautifulSoup(response.text, "html.parser")
         except Exception as e:
-            print(f"Scraping Error at {url}: {e}")
+            print(f"[ScraperEngine] Error fetching {url}: {e}")
             return None
 
     def _get_ajax(self, endpoint, params=None):
-        """Fetch AJAX JSON endpoint"""
+        """Fetch an AJAX JSON endpoint."""
         url = f"{AJAX_BASE}/{endpoint}"
-        headers = {
-            "User-Agent": random.choice(self.user_agents),
-            "X-Requested-With": "XMLHttpRequest"
-        }
+        headers = {**self._headers(), "X-Requested-With": "XMLHttpRequest"}
         try:
-            resp = self.session.get(url, params=params, headers=headers, timeout=10)
-            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("application/json"):
+            resp = self.session.get(url, params=params, headers=headers, timeout=12)
+            if resp.status_code == 200 and "application/json" in resp.headers.get("content-type", ""):
                 return resp.json()
             return None
-        except:
+        except Exception as e:
+            print(f"[ScraperEngine] AJAX error at {url}: {e}")
             return None
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_img(tag):
+        if not tag:
+            return None
+        src = tag.get("data-src") or tag.get("src") or ""
+        return ("https:" + src) if src.startswith("//") else (src or None)
+
+    @staticmethod
+    def _slug_to_id(href):
+        """Return the numeric ID appended at the end of a slug, or the slug itself."""
+        slug = href.strip("/").split("/")[-1]
+        m = re.search(r"-(\d+)$", slug)
+        return m.group(1) if m else slug
+
+    # ── Scrapers ─────────────────────────────────────────────────────────────
 
     def get_trending(self):
         soup = self._get_soup(f"{BASE_URL}/home")
@@ -63,63 +84,72 @@ class ScraperEngine:
             return []
 
         trending = []
-        # Find section by heading text (more reliable than class names)
-        trending_section = None
-        for h in soup.find_all(['h2', 'h3', 'div'], string=re.compile(r'(?i)trending', re.I)):
-            parent = h.find_parent(['section', 'div'])
-            if parent:
-                trending_section = parent
-                break
+        # aniwatchtv uses the same sidebar widget structure as hianime
+        # The trending block has items like: <div class="swiper-slide"> … </div>
+        # with <a href="/slug"> and a rank <div class="number"><span>01</span></div>
+        section = soup.find("div", class_=re.compile(r"(?i)trending"))
+        if not section:
+            # Broader fallback: find a heading that says "Trending"
+            heading = soup.find(string=re.compile(r"(?i)^trending$"))
+            section = heading.find_parent(["section", "div"]) if heading else None
 
-        if trending_section:
-            # Look for links with anime titles (broad match)
-            items = trending_section.select('a[href*="/"]')
-            for i, item in enumerate(items[:15], 1):  # limit to reasonable number
-                title = item.get_text(strip=True)
-                if not title or len(title) < 3 or 'episode' in title.lower():
+        if section:
+            for i, item in enumerate(section.select("a[href]"), 1):
+                href = item.get("href", "")
+                if not href or href in ("/", "#") or "/home" in href:
                     continue
-                href = item.get('href', '')
-                if not href or '/home' in href or href.startswith('#'):
+                slug = href.strip("/").split("/")[-1]
+                if not slug or "-" not in slug:
                     continue
-                slug = href.strip('/').split('/')[-1]
-                if slug and '-' in slug:
-                    trending.append({
-                        "rank": f"{i:02d}",
-                        "title": title,
-                        "id": slug
-                    })
+                title_tag = item.find(["h3", "h4", "div", "span"],
+                                      class_=re.compile(r"(?i)title|name"))
+                title = title_tag.get_text(strip=True) if title_tag else item.get_text(strip=True)
+                if not title or len(title) < 2:
+                    continue
+                rank_tag = item.find(["span", "div"], class_=re.compile(r"(?i)number|rank"))
+                rank = rank_tag.get_text(strip=True) if rank_tag else f"{i:02d}"
+                trending.append({"rank": rank, "title": title, "id": slug})
+                if len(trending) >= 15:
+                    break
+
         return trending
 
     def get_sidebar_list(self, list_type="top-airing"):
+        """
+        Scrape one of the ranked sidebar lists on the home page.
+        list_type values: "top-airing" | "most-popular" | "most-favorite"
+        """
         soup = self._get_soup(f"{BASE_URL}/home")
         if not soup:
             return []
 
         results = []
-        # Normalize to title case for matching
-        search_term = list_type.replace('-', ' ').title()
+        search_term = list_type.replace("-", " ")
 
-        # Find heading containing the term
-        target_heading = soup.find(['h2', 'h3', 'div'], string=re.compile(re.escape(search_term), re.I))
-        if target_heading:
-            block = target_heading.find_parent(['div', 'section', 'aside'])
-            if block:
-                items = block.select('a[href*="/"]')
-                for item in items:
-                    title = item.get_text(strip=True)
-                    if not title or len(title) < 3:
-                        continue
-                    href = item.get('href', '')
-                    slug = href.strip('/').split('/')[-1] if href else ""
-                    if slug and '-' in slug:
-                        # Try to find rank if nearby
-                        rank_elem = item.find_previous(['span', 'div'], string=re.compile(r'^\d+$'))
-                        rank = rank_elem.get_text(strip=True) if rank_elem else "N/A"
-                        results.append({
-                            "rank": rank,
-                            "title": title,
-                            "id": slug
-                        })
+        # Find the tab/heading whose text matches (case-insensitive)
+        heading = soup.find(
+            string=re.compile(re.escape(search_term), re.I)
+        )
+        block = heading.find_parent(["div", "section", "aside", "ul"]) if heading else None
+
+        if block:
+            for item in block.select("li, div.item, div[class*='item']"):
+                link = item.find("a", href=True)
+                if not link:
+                    continue
+                href = link["href"]
+                slug = href.strip("/").split("/")[-1]
+                if not slug or "-" not in slug:
+                    continue
+                title_tag = link.find(["h3", "span", "div"], class_=re.compile(r"(?i)title|name")) \
+                            or link
+                title = title_tag.get_text(strip=True)
+                if not title or len(title) < 2:
+                    continue
+                rank_tag = item.find(string=re.compile(r"^\d+$"))
+                rank = rank_tag.strip() if rank_tag else "N/A"
+                results.append({"rank": rank, "title": title, "id": slug})
+
         return results
 
     def search(self, keyword, page=1):
@@ -129,54 +159,44 @@ class ScraperEngine:
             return {"items": [], "total_pages": 1, "current_page": page}
 
         items = []
-        # Very broad selector then filter
-        candidates = soup.select('a[href*="/"]')
-        for el in candidates:
-            href = el.get('href', '')
-            if not href or '/search' in href or '/home' in href or href.startswith('#'):
+        # aniwatchtv uses .flw-item cards in search results (same as hianime)
+        for card in soup.select(".flw-item"):
+            link = card.select_one("a.film-poster-ahref, a[href*='/']")
+            if not link:
                 continue
-            slug = href.strip('/').split('/')[-1]
-            if not slug or '-' not in slug:
+            href = link.get("href", "")
+            slug = href.strip("/").split("/")[-1]
+            if not slug or "-" not in slug:
                 continue
+            anime_id = self._slug_to_id(href)
 
-            id_match = re.search(r'-(\d+)$', slug)
-            anime_id = id_match.group(1) if id_match else slug
+            title_tag = card.select_one(".film-name, h3.film-name, .film-detail h3")
+            title = title_tag.get_text(strip=True) if title_tag else "???"
 
-            title = el.get_text(strip=True)
-            if not title:
-                title_elem = el.select_one('span, div, p')
-                title = title_elem.get_text(strip=True) if title_elem else "???"
+            img_tag = card.select_one("img")
+            poster = self._resolve_img(img_tag)
 
-            poster = None
-            img = el.select_one('img')
-            if img:
-                poster = img.get('data-src') or img.get('src')
-                if poster and poster.startswith('//'):
-                    poster = 'https:' + poster
-
-            # Try to find type/year nearby
-            info_text = ""
-            next_sib = el.find_next(['span', 'div', 'small'])
-            if next_sib:
-                info_text = next_sib.get_text(strip=True)
-            typ = info_text.split('-')[0].strip() if info_text else None
+            type_tag = card.select_one(".fdi-item, .tick-item, .film-infor span")
+            anime_type = type_tag.get_text(strip=True) if type_tag else None
 
             items.append({
                 "id": anime_id,
                 "slug": slug,
                 "title": title,
                 "poster": poster,
-                "type": typ,
-                "year": None  # often not reliably present
+                "type": anime_type,
             })
 
-        # Pagination
-        pagination = soup.find(['nav', 'div'], class_=re.compile(r'pag|page'))
+        # Pagination: find the last numbered page link
         total_pages = 1
-        if pagination:
-            last_link = pagination.find('a', string=re.compile(r'\d+'))  # last numeric link
-            if last_link and last_link.text.isdigit():
-                total_pages = int(last_link.text)
+        pag = soup.select_one(".pagination, nav[aria-label*='page'], ul.pagination")
+        if pag:
+            page_links = pag.select("a[href]")
+            for a in reversed(page_links):
+                txt = a.get_text(strip=True)
+                if txt.isdigit():
+                    total_pages = int(txt)
+                    break
 
         return {"items": items, "total_pages": total_pages, "current_page": page}
 
@@ -186,42 +206,49 @@ class ScraperEngine:
         if not soup:
             return None
 
-        # Title - broad search
-        title_elem = soup.find(['h1', 'h2'], string=True) or soup.find(['div', 'span'], class_=re.compile(r'(?i)title|name'))
-        title = title_elem.get_text(strip=True) if title_elem else "Unknown"
+        # Title
+        title_tag = (
+            soup.select_one("h2.film-name, h1.film-name, .anisc-detail h2, .anisc-detail h1")
+            or soup.find(["h1", "h2"])
+        )
+        title = title_tag.get_text(strip=True) if title_tag else "Unknown"
 
         # Synopsis
-        synopsis_elem = soup.find(['div', 'p'], string=re.compile(r'(?i)plot|summary|synopsis|overview|description', re.I)) \
-                       or soup.find(['div', 'p'], class_=re.compile(r'(?i)desc|overview|synopsis'))
-        synopsis = synopsis_elem.get_text(strip=True) if synopsis_elem else None
+        synopsis_tag = soup.select_one(
+            ".film-description .text, .anisc-detail .film-description, [class*='description'], [class*='overview']"
+        )
+        synopsis = synopsis_tag.get_text(strip=True) if synopsis_tag else None
 
         # Poster
-        poster_elem = soup.find('img', attrs={"src": re.compile(r'(cover|poster|banner)')}) \
-                      or soup.find('img', class_=re.compile(r'(?i)poster|cover'))
-        poster = poster_elem.get('src') or poster_elem.get('data-src') if poster_elem else None
-        if poster and poster.startswith('//'):
-            poster = "https:" + poster
+        poster_tag = soup.select_one(
+            ".film-poster img, .anisc-poster img, img[src*='cover'], img[src*='poster']"
+        )
+        poster = self._resolve_img(poster_tag)
 
-        # Info block - very generic fallback
+        # Info block (genres, status, aired, studios, etc.)
         info = {}
-        possible_rows = soup.find_all(['div', 'li', 'span'], class_=re.compile(r'(?i)info|meta|detail|row|item'))
-        for row in possible_rows:
-            name = row.find(['span', 'div'], class_=re.compile(r'(?i)name|label|key'))
-            value = row.find(['span', 'div', 'a'], class_=re.compile(r'(?i)value|content|text'))
-            if name and value:
-                key = name.get_text(strip=True).rstrip(':').lower().replace(' ', '_')
-                val = value.get_text(strip=True)
-                if key == "genres":
-                    val = [g.strip() for g in val.split(',') if g.strip()]
-                if key and val:
-                    info[key] = val
+        for row in soup.select(".item-list a, .anisc-info .item"):
+            name_tag = row.select_one(".item-head, span.name, .item-title")
+            value_tag = row.select_one("span.name, a, .item-value")
+            if name_tag and value_tag:
+                key = name_tag.get_text(strip=True).rstrip(":").lower().replace(" ", "_")
+                val = value_tag.get_text(strip=True)
+                info[key] = val
+            elif not name_tag:
+                # Genre links directly
+                pass
+
+        # Genres — explicit selector
+        genre_links = soup.select(".anisc-info a[href*='/genre/'], .item-list a[href*='/genre/']")
+        if genre_links:
+            info["genres"] = [a.get_text(strip=True) for a in genre_links]
 
         return {
             "id": anime_id,
             "title": title,
             "synopsis": synopsis,
             "poster": poster,
-            **info
+            **info,
         }
 
     def get_episodes(self, anime_id):
@@ -233,58 +260,63 @@ class ScraperEngine:
         episodes = []
         anime_ajax_id = None
 
-        # Extract anime_id from scripts (this part usually still works)
-        script_tags = soup.find_all("script")
-        for script in script_tags:
-            if script.string and "anime_id" in script.string:
-                match = re.search(r'anime_id\s*[:=]\s*["\']?(\d+)', script.string)
-                if match:
-                    anime_ajax_id = match.group(1)
+        # Extract the numeric anime_id embedded in the page scripts / data attributes
+        # Method 1: data attribute on the episode list container
+        ep_container = soup.select_one("#episodes-btn, [data-id], #detail-dp-btn")
+        if ep_container:
+            anime_ajax_id = ep_container.get("data-id")
+
+        # Method 2: inline script
+        if not anime_ajax_id:
+            for script in soup.find_all("script"):
+                text = script.string or ""
+                m = re.search(r'(?:anime_id|animeId)\s*[:=]\s*["\']?(\d+)', text)
+                if m:
+                    anime_ajax_id = m.group(1)
                     break
+
+        # Method 3: numeric suffix of the slug
+        if not anime_ajax_id:
+            m = re.search(r"-(\d+)$", anime_id)
+            if m:
+                anime_ajax_id = m.group(1)
 
         if anime_ajax_id:
             ajax_data = self._get_ajax(f"v2/episode/list/{anime_ajax_id}")
-            if ajax_data and "html" in ajax_data and ajax_data["html"]:
+            if ajax_data and ajax_data.get("html"):
                 ep_soup = BeautifulSoup(ajax_data["html"], "html.parser")
-                episode_links = ep_soup.select('a[data-id], a[data-num], a.episode, a[href*="ep="]')
-                for a in episode_links:
-                    ep_num = (
-                        a.get("data-number")
-                        or a.get("data-num")
-                        or a.get("data-episode-number")
-                        or a.select_one('[class*="num"], .number')
-                    )
-                    ep_num = ep_num.get_text(strip=True) if hasattr(ep_num, "get_text") else str(ep_num) if ep_num else ""
-                    ep_id = a.get("data-id") or a.get("href", "").split("?ep=")[-1].split('#')[0]
-                    ep_title = a.get("title") or a.select_one('[class*="title"], .name')
-                    ep_title = ep_title.get_text(strip=True) if hasattr(ep_title, "get_text") else ""
+                for a in ep_soup.select("a[data-id][data-number], a[href*='?ep=']"):
+                    ep_num = a.get("data-number") or a.get("data-num") or ""
+                    ep_id = a.get("data-id") or a.get("href", "").split("?ep=")[-1].split("#")[0]
+                    title_tag = a.select_one(".ep-name, .title, [class*='title']")
+                    ep_title = (title_tag.get_text(strip=True) if title_tag else None) \
+                               or a.get("title") or f"Episode {ep_num}"
                     if ep_num and ep_id:
                         episodes.append({
                             "number": ep_num,
                             "id": ep_id,
-                            "title": ep_title or f"Episode {ep_num}"
+                            "title": ep_title,
                         })
 
-        # Fallback: direct scraping if AJAX didn't work
+        # Fallback: direct page scraping
         if not episodes:
-            ep_containers = soup.select('[class*="episode"], [class*="ep-"], ul li a[href*="ep="]')
-            for el in ep_containers:
-                num_elem = el.find(['span', 'div'], class_=re.compile(r'(?i)num|episode|ep-'))
-                num = num_elem.get_text(strip=True) if num_elem else el.get_text(strip=True).split()[0]
-                ep_id = el.get("data-id") or el.get("href", "").split("?ep=")[-1].split('#')[0]
-                title_elem = el.find(['span', 'div'], class_=re.compile(r'(?i)title|name'))
-                title = title_elem.get_text(strip=True) if title_elem else ""
+            for el in soup.select("[class*='ep-'] a, ul.ep-list li a, a[href*='?ep=']"):
+                num_tag = el.select_one("[class*='num'], [class*='number']")
+                num = num_tag.get_text(strip=True) if num_tag else ""
+                ep_id = el.get("data-id") or el.get("href", "").split("?ep=")[-1].split("#")[0]
+                title_tag = el.select_one("[class*='title'], [class*='name']")
+                title = title_tag.get_text(strip=True) if title_tag else f"Episode {num}"
                 if num and ep_id:
-                    episodes.append({
-                        "number": num,
-                        "id": ep_id,
-                        "title": title or f"Episode {num}"
-                    })
+                    episodes.append({"number": num, "id": ep_id, "title": title})
 
-        # Sort numerically where possible
+        # Sort numerically
         try:
-            episodes.sort(key=lambda x: float(x["number"]) if re.match(r'^\d+(\.\d+)?$', str(x["number"])) else 9999)
-        except:
+            episodes.sort(
+                key=lambda x: float(x["number"])
+                if re.match(r"^\d+(\.\d+)?$", str(x["number"]))
+                else 9999
+            )
+        except Exception:
             pass
 
         return episodes
@@ -303,10 +335,10 @@ def api_discover():
         return jsonify({
             "status": "success",
             "data": {
-                "trending": scraper.get_trending(),
-                "top_airing": scraper.get_sidebar_list("top-airing"),
-                "most_popular": scraper.get_sidebar_list("most-popular"),
-                "most-favorite": scraper.get_sidebar_list("most-favorite")
+                "trending":      scraper.get_trending(),
+                "top_airing":    scraper.get_sidebar_list("top-airing"),
+                "most_popular":  scraper.get_sidebar_list("most-popular"),
+                "most_favorite": scraper.get_sidebar_list("most-favorite"),
             }
         })
     except Exception as e:
@@ -319,7 +351,6 @@ def api_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"status": "error", "message": "Missing query parameter 'q'"}), 400
-
     page = int(request.args.get("page", 1))
     try:
         data = scraper.search(q, page)
