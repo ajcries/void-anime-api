@@ -2,381 +2,378 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_caching import Cache
 import requests
-from bs4 import BeautifulSoup
-import random
-import re
-from urllib.parse import quote_plus
+from datetime import datetime
 
 # --- Configuration ---
 api_app = Flask(__name__)
 CORS(api_app)
 
-# Caching: 1 hour default, some endpoints override with shorter/longer times
 cache = Cache(api_app, config={
     'CACHE_TYPE': 'SimpleCache',
     'CACHE_DEFAULT_TIMEOUT': 3600
 })
 
-BASE_URL = "https://aniwatchtv.to"
-AJAX_BASE = f"{BASE_URL}/ajax"
+ANILIST_API    = "https://graphql.anilist.co"
+MEGAPLAY_BASE  = "https://megaplay.buzz/stream"
 
 
-class ScraperEngine:
+# ─────────────────────────────────────────────────────────────────────────────
+#  AniList GraphQL client
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AniListClient:
     def __init__(self):
         self.session = requests.Session()
-        self.user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ]
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "Accept":       "application/json",
+        })
 
-    def _headers(self):
-        return {
-            "User-Agent": random.choice(self.user_agents),
-            "Referer": BASE_URL,
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
-    def _get_soup(self, url, timeout=12):
-        """Fetch and parse HTML with rotating headers."""
+    def query(self, query: str, variables: dict | None = None):
         try:
-            response = self.session.get(url, headers=self._headers(), timeout=timeout)
-            response.raise_for_status()
-            return BeautifulSoup(response.text, "html.parser")
-        except Exception as e:
-            print(f"[ScraperEngine] Error fetching {url}: {e}")
-            return None
-
-    def _get_ajax(self, endpoint, params=None):
-        """Fetch an AJAX JSON endpoint."""
-        url = f"{AJAX_BASE}/{endpoint}"
-        headers = {**self._headers(), "X-Requested-With": "XMLHttpRequest"}
-        try:
-            resp = self.session.get(url, params=params, headers=headers, timeout=12)
-            if resp.status_code == 200 and "application/json" in resp.headers.get("content-type", ""):
-                return resp.json()
-            return None
-        except Exception as e:
-            print(f"[ScraperEngine] AJAX error at {url}: {e}")
-            return None
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _resolve_img(tag):
-        if not tag:
-            return None
-        src = tag.get("data-src") or tag.get("src") or ""
-        return ("https:" + src) if src.startswith("//") else (src or None)
-
-    @staticmethod
-    def _slug_to_id(href):
-        """Return the numeric ID appended at the end of a slug, or the slug itself."""
-        slug = href.strip("/").split("/")[-1]
-        m = re.search(r"-(\d+)$", slug)
-        return m.group(1) if m else slug
-
-    # ── Scrapers ─────────────────────────────────────────────────────────────
-
-    def get_trending(self):
-        soup = self._get_soup(f"{BASE_URL}/home")
-        if not soup:
-            return []
-
-        trending = []
-        # aniwatchtv uses the same sidebar widget structure as hianime
-        # The trending block has items like: <div class="swiper-slide"> … </div>
-        # with <a href="/slug"> and a rank <div class="number"><span>01</span></div>
-        section = soup.find("div", class_=re.compile(r"(?i)trending"))
-        if not section:
-            # Broader fallback: find a heading that says "Trending"
-            heading = soup.find(string=re.compile(r"(?i)^trending$"))
-            section = heading.find_parent(["section", "div"]) if heading else None
-
-        if section:
-            for i, item in enumerate(section.select("a[href]"), 1):
-                href = item.get("href", "")
-                if not href or href in ("/", "#") or "/home" in href:
-                    continue
-                slug = href.strip("/").split("/")[-1]
-                if not slug or "-" not in slug:
-                    continue
-                title_tag = item.find(["h3", "h4", "div", "span"],
-                                      class_=re.compile(r"(?i)title|name"))
-                title = title_tag.get_text(strip=True) if title_tag else item.get_text(strip=True)
-                if not title or len(title) < 2:
-                    continue
-                rank_tag = item.find(["span", "div"], class_=re.compile(r"(?i)number|rank"))
-                rank = rank_tag.get_text(strip=True) if rank_tag else f"{i:02d}"
-                trending.append({"rank": rank, "title": title, "id": slug})
-                if len(trending) >= 15:
-                    break
-
-        return trending
-
-    def get_sidebar_list(self, list_type="top-airing"):
-        """
-        Scrape one of the ranked sidebar lists on the home page.
-        list_type values: "top-airing" | "most-popular" | "most-favorite"
-        """
-        soup = self._get_soup(f"{BASE_URL}/home")
-        if not soup:
-            return []
-
-        results = []
-        search_term = list_type.replace("-", " ")
-
-        # Find the tab/heading whose text matches (case-insensitive)
-        heading = soup.find(
-            string=re.compile(re.escape(search_term), re.I)
-        )
-        block = heading.find_parent(["div", "section", "aside", "ul"]) if heading else None
-
-        if block:
-            for item in block.select("li, div.item, div[class*='item']"):
-                link = item.find("a", href=True)
-                if not link:
-                    continue
-                href = link["href"]
-                slug = href.strip("/").split("/")[-1]
-                if not slug or "-" not in slug:
-                    continue
-                title_tag = link.find(["h3", "span", "div"], class_=re.compile(r"(?i)title|name")) \
-                            or link
-                title = title_tag.get_text(strip=True)
-                if not title or len(title) < 2:
-                    continue
-                rank_tag = item.find(string=re.compile(r"^\d+$"))
-                rank = rank_tag.strip() if rank_tag else "N/A"
-                results.append({"rank": rank, "title": title, "id": slug})
-
-        return results
-
-    def search(self, keyword, page=1):
-        url = f"{BASE_URL}/search?keyword={quote_plus(keyword)}&page={page}"
-        soup = self._get_soup(url)
-        if not soup:
-            return {"items": [], "total_pages": 1, "current_page": page}
-
-        items = []
-        # aniwatchtv uses .flw-item cards in search results (same as hianime)
-        for card in soup.select(".flw-item"):
-            link = card.select_one("a.film-poster-ahref, a[href*='/']")
-            if not link:
-                continue
-            href = link.get("href", "")
-            slug = href.strip("/").split("/")[-1]
-            if not slug or "-" not in slug:
-                continue
-            anime_id = self._slug_to_id(href)
-
-            title_tag = card.select_one(".film-name, h3.film-name, .film-detail h3")
-            title = title_tag.get_text(strip=True) if title_tag else "???"
-
-            img_tag = card.select_one("img")
-            poster = self._resolve_img(img_tag)
-
-            type_tag = card.select_one(".fdi-item, .tick-item, .film-infor span")
-            anime_type = type_tag.get_text(strip=True) if type_tag else None
-
-            items.append({
-                "id": anime_id,
-                "slug": slug,
-                "title": title,
-                "poster": poster,
-                "type": anime_type,
-            })
-
-        # Pagination: find the last numbered page link
-        total_pages = 1
-        pag = soup.select_one(".pagination, nav[aria-label*='page'], ul.pagination")
-        if pag:
-            page_links = pag.select("a[href]")
-            for a in reversed(page_links):
-                txt = a.get_text(strip=True)
-                if txt.isdigit():
-                    total_pages = int(txt)
-                    break
-
-        return {"items": items, "total_pages": total_pages, "current_page": page}
-
-    def get_anime_info(self, anime_id):
-        url = f"{BASE_URL}/{anime_id}"
-        soup = self._get_soup(url)
-        if not soup:
-            return None
-
-        # Title
-        title_tag = (
-            soup.select_one("h2.film-name, h1.film-name, .anisc-detail h2, .anisc-detail h1")
-            or soup.find(["h1", "h2"])
-        )
-        title = title_tag.get_text(strip=True) if title_tag else "Unknown"
-
-        # Synopsis
-        synopsis_tag = soup.select_one(
-            ".film-description .text, .anisc-detail .film-description, [class*='description'], [class*='overview']"
-        )
-        synopsis = synopsis_tag.get_text(strip=True) if synopsis_tag else None
-
-        # Poster
-        poster_tag = soup.select_one(
-            ".film-poster img, .anisc-poster img, img[src*='cover'], img[src*='poster']"
-        )
-        poster = self._resolve_img(poster_tag)
-
-        # Info block (genres, status, aired, studios, etc.)
-        info = {}
-        for row in soup.select(".item-list a, .anisc-info .item"):
-            name_tag = row.select_one(".item-head, span.name, .item-title")
-            value_tag = row.select_one("span.name, a, .item-value")
-            if name_tag and value_tag:
-                key = name_tag.get_text(strip=True).rstrip(":").lower().replace(" ", "_")
-                val = value_tag.get_text(strip=True)
-                info[key] = val
-            elif not name_tag:
-                # Genre links directly
-                pass
-
-        # Genres — explicit selector
-        genre_links = soup.select(".anisc-info a[href*='/genre/'], .item-list a[href*='/genre/']")
-        if genre_links:
-            info["genres"] = [a.get_text(strip=True) for a in genre_links]
-
-        return {
-            "id": anime_id,
-            "title": title,
-            "synopsis": synopsis,
-            "poster": poster,
-            **info,
-        }
-
-    def get_episodes(self, anime_id):
-        url = f"{BASE_URL}/{anime_id}"
-        soup = self._get_soup(url)
-        if not soup:
-            return []
-
-        episodes = []
-        anime_ajax_id = None
-
-        # Extract the numeric anime_id embedded in the page scripts / data attributes
-        # Method 1: data attribute on the episode list container
-        ep_container = soup.select_one("#episodes-btn, [data-id], #detail-dp-btn")
-        if ep_container:
-            anime_ajax_id = ep_container.get("data-id")
-
-        # Method 2: inline script
-        if not anime_ajax_id:
-            for script in soup.find_all("script"):
-                text = script.string or ""
-                m = re.search(r'(?:anime_id|animeId)\s*[:=]\s*["\']?(\d+)', text)
-                if m:
-                    anime_ajax_id = m.group(1)
-                    break
-
-        # Method 3: numeric suffix of the slug
-        if not anime_ajax_id:
-            m = re.search(r"-(\d+)$", anime_id)
-            if m:
-                anime_ajax_id = m.group(1)
-
-        if anime_ajax_id:
-            ajax_data = self._get_ajax(f"v2/episode/list/{anime_ajax_id}")
-            if ajax_data and ajax_data.get("html"):
-                ep_soup = BeautifulSoup(ajax_data["html"], "html.parser")
-                for a in ep_soup.select("a[data-id][data-number], a[href*='?ep=']"):
-                    ep_num = a.get("data-number") or a.get("data-num") or ""
-                    ep_id = a.get("data-id") or a.get("href", "").split("?ep=")[-1].split("#")[0]
-                    title_tag = a.select_one(".ep-name, .title, [class*='title']")
-                    ep_title = (title_tag.get_text(strip=True) if title_tag else None) \
-                               or a.get("title") or f"Episode {ep_num}"
-                    if ep_num and ep_id:
-                        episodes.append({
-                            "number": ep_num,
-                            "id": ep_id,
-                            "title": ep_title,
-                        })
-
-        # Fallback: direct page scraping
-        if not episodes:
-            for el in soup.select("[class*='ep-'] a, ul.ep-list li a, a[href*='?ep=']"):
-                num_tag = el.select_one("[class*='num'], [class*='number']")
-                num = num_tag.get_text(strip=True) if num_tag else ""
-                ep_id = el.get("data-id") or el.get("href", "").split("?ep=")[-1].split("#")[0]
-                title_tag = el.select_one("[class*='title'], [class*='name']")
-                title = title_tag.get_text(strip=True) if title_tag else f"Episode {num}"
-                if num and ep_id:
-                    episodes.append({"number": num, "id": ep_id, "title": title})
-
-        # Sort numerically
-        try:
-            episodes.sort(
-                key=lambda x: float(x["number"])
-                if re.match(r"^\d+(\.\d+)?$", str(x["number"]))
-                else 9999
+            r = self.session.post(
+                ANILIST_API,
+                json={"query": query, "variables": variables or {}},
+                timeout=15,
             )
-        except Exception:
-            pass
+            if r.status_code == 429:
+                print("[AniList] rate limited")
+                return None
+            r.raise_for_status()
+            payload = r.json()
+            if "errors" in payload:
+                print(f"[AniList] errors: {payload['errors']}")
+                return None
+            return payload.get("data")
+        except Exception as e:
+            print(f"[AniList] request failed: {e}")
+            return None
 
-        return episodes
+
+anilist = AniListClient()
 
 
-# Initialize scraper
-scraper = ScraperEngine()
+# ─────────────────────────────────────────────────────────────────────────────
+#  GraphQL fragments — kept small so we can reuse them across queries
+# ─────────────────────────────────────────────────────────────────────────────
+
+MEDIA_CARD = """
+  id
+  idMal
+  title { romaji english native }
+  coverImage { large extraLarge color }
+  bannerImage
+  format
+  status
+  episodes
+  duration
+  averageScore
+  season
+  seasonYear
+  genres
+  nextAiringEpisode { episode airingAt timeUntilAiring }
+"""
+
+MEDIA_FULL = """
+  id
+  idMal
+  title { romaji english native }
+  description(asHtml: false)
+  coverImage { extraLarge large color }
+  bannerImage
+  format
+  status
+  episodes
+  duration
+  averageScore
+  meanScore
+  popularity
+  favourites
+  season
+  seasonYear
+  startDate { year month day }
+  endDate   { year month day }
+  genres
+  studios(isMain: true) { nodes { id name } }
+  trailer { id site }
+  nextAiringEpisode { episode airingAt timeUntilAiring }
+  streamingEpisodes { title thumbnail url site }
+  recommendations(sort: RATING_DESC, perPage: 12) {
+    nodes {
+      mediaRecommendation {
+        id
+        idMal
+        title { romaji english }
+        coverImage { large }
+        format
+        episodes
+        averageScore
+      }
+    }
+  }
+"""
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-@api_app.route('/api/discover')
-@cache.cached(timeout=43200)  # 12 hours
+def _shape_card(m: dict) -> dict:
+    """Normalize an AniList Media node into a flat card object."""
+    if not m:
+        return {}
+    title = m.get("title") or {}
+    return {
+        "anilist_id": m.get("id"),
+        "mal_id":     m.get("idMal"),
+        "title":      title.get("english") or title.get("romaji") or title.get("native"),
+        "title_romaji":  title.get("romaji"),
+        "title_native":  title.get("native"),
+        "cover":      (m.get("coverImage") or {}).get("extraLarge")
+                      or (m.get("coverImage") or {}).get("large"),
+        "banner":     m.get("bannerImage"),
+        "color":      (m.get("coverImage") or {}).get("color"),
+        "format":     m.get("format"),
+        "status":     m.get("status"),
+        "episodes":   m.get("episodes"),
+        "duration":   m.get("duration"),
+        "score":      m.get("averageScore"),
+        "season":     m.get("season"),
+        "year":       m.get("seasonYear"),
+        "genres":     m.get("genres") or [],
+        "next_episode": (m.get("nextAiringEpisode") or {}).get("episode"),
+        "next_airing_at": (m.get("nextAiringEpisode") or {}).get("airingAt"),
+    }
+
+
+def _available_episode_count(m: dict) -> int:
+    """
+    AniList gives total `episodes` for finished shows but often `null` for
+    currently-airing ones. `nextAiringEpisode.episode - 1` gives the last aired.
+    """
+    eps = m.get("episodes")
+    if eps:
+        return int(eps)
+    nxt = (m.get("nextAiringEpisode") or {}).get("episode")
+    if nxt and nxt > 1:
+        return int(nxt) - 1
+    return 0
+
+
+def _embed_url(anilist_id=None, mal_id=None, episode=1, language="sub"):
+    if language not in ("sub", "dub"):
+        language = "sub"
+    if anilist_id:
+        return f"{MEGAPLAY_BASE}/ani/{anilist_id}/{episode}/{language}"
+    if mal_id:
+        return f"{MEGAPLAY_BASE}/mal/{mal_id}/{episode}/{language}"
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+@api_app.route("/api/discover")
+@cache.cached(timeout=21600)  # 6 hours
 def api_discover():
+    """Trending / Popular this season / Top rated / Upcoming."""
     try:
+        season = None
+        month = datetime.utcnow().month
+        if   month in (1, 2, 3):    season = "WINTER"
+        elif month in (4, 5, 6):    season = "SPRING"
+        elif month in (7, 8, 9):    season = "SUMMER"
+        else:                       season = "FALL"
+
+        def page(sort, extra=""):
+            q = f"""
+            query ($page: Int, $sort: [MediaSort], $season: MediaSeason) {{
+              Page(page: $page, perPage: 20) {{
+                media(type: ANIME, sort: $sort, season: $season, isAdult: false {extra}) {{
+                  {MEDIA_CARD}
+                }}
+              }}
+            }}
+            """
+            vars_ = {"page": 1, "sort": [sort]}
+            if "$season" in q:
+                vars_["season"] = season
+            data = anilist.query(q, vars_)
+            return [( _shape_card(m) ) for m in (data or {}).get("Page", {}).get("media", [])]
+
         return jsonify({
             "status": "success",
             "data": {
-                "trending":      scraper.get_trending(),
-                "top_airing":    scraper.get_sidebar_list("top-airing"),
-                "most_popular":  scraper.get_sidebar_list("most-popular"),
-                "most_favorite": scraper.get_sidebar_list("most-favorite"),
+                "trending":  page("TRENDING_DESC"),
+                "popular":   page("POPULARITY_DESC"),
+                "top_rated": page("SCORE_DESC"),
+                "upcoming":  page("POPULARITY_DESC", ", status: NOT_YET_RELEASED"),
             }
         })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
-@api_app.route('/api/search')
-@cache.cached(timeout=3600, query_string=True)
+@api_app.route("/api/search")
+@cache.cached(timeout=1800, query_string=True)
 def api_search():
     q = request.args.get("q", "").strip()
     if not q:
-        return jsonify({"status": "error", "message": "Missing query parameter 'q'"}), 400
-    page = int(request.args.get("page", 1))
+        return jsonify({"status": "error", "message": "Missing 'q'"}), 400
+
+    page_num = max(1, int(request.args.get("page", 1)))
+    per_page = min(50, max(1, int(request.args.get("per_page", 20))))
+
+    query = f"""
+    query ($search: String, $page: Int, $perPage: Int) {{
+      Page(page: $page, perPage: $perPage) {{
+        pageInfo {{ total currentPage lastPage hasNextPage }}
+        media(type: ANIME, search: $search, isAdult: false, sort: SEARCH_MATCH) {{
+          {MEDIA_CARD}
+        }}
+      }}
+    }}
+    """
+    data = anilist.query(query, {"search": q, "page": page_num, "perPage": per_page})
+    if not data:
+        return jsonify({"status": "error", "message": "AniList query failed"}), 502
+
+    page_obj = data.get("Page", {})
+    return jsonify({
+        "status": "success",
+        "data": {
+            "items":       [_shape_card(m) for m in page_obj.get("media", [])],
+            "page_info":   page_obj.get("pageInfo", {}),
+            "current_page": page_num,
+        }
+    })
+
+
+@api_app.route("/api/anime/<int:anilist_id>")
+@cache.cached(timeout=21600)  # 6 hours
+def api_anime(anilist_id):
+    query = f"""
+    query ($id: Int) {{
+      Media(id: $id, type: ANIME) {{
+        {MEDIA_FULL}
+      }}
+    }}
+    """
+    data = anilist.query(query, {"id": anilist_id})
+    if not data or not data.get("Media"):
+        return jsonify({"status": "error", "message": "Anime not found"}), 404
+
+    m = data["Media"]
+    card = _shape_card(m)
+
+    recs = []
+    for node in (m.get("recommendations") or {}).get("nodes", []):
+        r = node.get("mediaRecommendation")
+        if r:
+            recs.append(_shape_card(r))
+
+    return jsonify({
+        "status": "success",
+        "data": {
+            **card,
+            "description": m.get("description"),
+            "mean_score":  m.get("meanScore"),
+            "popularity":  m.get("popularity"),
+            "favourites":  m.get("favourites"),
+            "start_date":  m.get("startDate"),
+            "end_date":    m.get("endDate"),
+            "studios":     [s["name"] for s in (m.get("studios") or {}).get("nodes", [])],
+            "trailer":     m.get("trailer"),
+            "streaming":   m.get("streamingEpisodes") or [],
+            "recommendations": recs,
+            "available_episodes": _available_episode_count(m),
+        }
+    })
+
+
+@api_app.route("/api/episodes/<int:anilist_id>")
+@cache.cached(timeout=3600)
+def api_episodes(anilist_id):
+    """
+    AniList has no per-episode records, only a total count.
+    We synthesize the episode list and pre-build both SUB and DUB embed URLs.
+    """
+    query = f"""
+    query ($id: Int) {{
+      Media(id: $id, type: ANIME) {{
+        id
+        idMal
+        title {{ romaji english }}
+        episodes
+        nextAiringEpisode {{ episode airingAt }}
+        streamingEpisodes {{ title thumbnail url site }}
+      }}
+    }}
+    """
+    data = anilist.query(query, {"id": anilist_id})
+    if not data or not data.get("Media"):
+        return jsonify({"status": "error", "message": "Anime not found"}), 404
+
+    m = data["Media"]
+    anilist_id_v = m["id"]
+    mal_id       = m.get("idMal")
+    total        = _available_episode_count(m)
+
+    # AniList's `streamingEpisodes` sometimes carries real episode titles
+    title_map = {}
+    for se in (m.get("streamingEpisodes") or []):
+        t = (se.get("title") or "").strip()
+        if t:
+            title_map[len(title_map) + 1] = t
+
+    episodes = []
+    for n in range(1, total + 1):
+        episodes.append({
+            "number": n,
+            "title":  title_map.get(n) or f"Episode {n}",
+            "embed_sub": _embed_url(anilist_id=anilist_id_v, episode=n, language="sub"),
+            "embed_dub": _embed_url(anilist_id=anilist_id_v, episode=n, language="dub"),
+        })
+
+    return jsonify({
+        "status": "success",
+        "data": {
+            "anilist_id": anilist_id_v,
+            "mal_id":     mal_id,
+            "total":      total,
+            "episodes":   episodes,
+        }
+    })
+
+
+@api_app.route("/api/embed")
+@cache.cached(timeout=86400, query_string=True)
+def api_embed():
+    """
+    Direct embed URL builder.
+    /api/embed?anilist_id=21&episode=1&lang=sub
+    /api/embed?mal_id=21&episode=1&lang=dub
+    """
     try:
-        data = scraper.search(q, page)
-        return jsonify({"status": "success", "data": data})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        anilist_id = request.args.get("anilist_id", type=int)
+        mal_id     = request.args.get("mal_id", type=int)
+        episode    = max(1, request.args.get("episode", default=1, type=int))
+        lang       = request.args.get("lang", "sub").lower()
 
+        if not anilist_id and not mal_id:
+            return jsonify({"status": "error", "message": "Provide anilist_id or mal_id"}), 400
 
-@api_app.route('/api/anime/<path:anime_id>')
-@cache.cached(timeout=7200)  # 2 hours
-def api_anime_info(anime_id):
-    try:
-        info = scraper.get_anime_info(anime_id)
-        if not info:
-            return jsonify({"status": "error", "message": "Anime not found"}), 404
-        return jsonify({"status": "success", "data": info})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-
-@api_app.route('/api/episodes/<path:anime_id>')
-@cache.cached(timeout=3600)  # 1 hour
-def api_episodes(anime_id):
-    try:
-        episodes = scraper.get_episodes(anime_id)
-        return jsonify({"status": "success", "data": episodes})
+        url = _embed_url(anilist_id=anilist_id, mal_id=mal_id,
+                         episode=episode, language=lang)
+        return jsonify({
+            "status": "success",
+            "data": {
+                "embed_url": url,
+                "iframe": f'<iframe src="{url}" width="100%" height="100%" '
+                          f'frameborder="0" scrolling="no" allowfullscreen></iframe>',
+            }
+        })
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
